@@ -4,7 +4,9 @@ import tempfile
 import time
 import unittest
 import uuid
+from subprocess import check_output
 
+import numpy as np
 import pytest
 
 from huggingface_hub import HfApi
@@ -15,6 +17,7 @@ from huggingface_hub.file_download import (
 )
 from huggingface_hub.keras_mixin import (
     KerasModelHubMixin,
+    PushToHubCallback,
     from_pretrained_keras,
     push_to_hub_keras,
     save_pretrained_keras,
@@ -177,19 +180,151 @@ class HubMixingTestKeras(unittest.TestCase):
 class HubKerasSequentialTest(HubMixingTestKeras):
     def model_init(self):
         model = tf.keras.models.Sequential()
+        model.add(tf.keras.layers.Input(shape=(None, 2)))
         model.add(tf.keras.layers.Dense(2, activation="relu"))
         model.compile(optimizer="adam", loss="mse")
         return model
 
-    def model_fit(self, model):
-        x = tf.constant([[0.44, 0.90], [0.65, 0.39]])
-        y = tf.constant([[1, 1], [0, 0]])
-        model.fit(x, y)
+    def batch_data(self, data, batch_size):
+        batched_features = []
+        for element in range(0, len(data), batch_size):
+            batched_features.append(
+                data[element : min(element + batch_size, len(data))]
+            )
+        return batched_features
+
+    def dummy_training_data(self, batch_size=None):
+        features = np.ones((9, 2))
+        labels = np.ones((9, 2))
+
+        if batch_size is not None:
+            features = tf.constant(self.batch_data(features, batch_size))
+            labels = tf.constant(self.batch_data(labels, batch_size))
+        else:
+            features = tf.constant(features)
+            labels = tf.constant(labels)
+
+        return features, labels
+
+    def model_fit(self, model, num_epochs, batch_size=None, callback=None):
+        x, y = self.dummy_training_data(batch_size)
+        if batch_size is not None:
+            model.fit(
+                tf.data.Dataset.from_tensor_slices((x, y)),
+                callbacks=callback,
+                epochs=num_epochs,
+                batch_size=batch_size,
+            )
+        else:
+            model.fit(
+                x, y, callbacks=callback, epochs=num_epochs, batch_size=batch_size
+            )
         return model
+
+    def test_callback_end_of_training(self):
+        REPO_NAME = repo_name("PUSH_TO_HUB")
+        model = self.model_init()
+
+        push_to_hub_callback = PushToHubCallback(
+            save_strategy="end_of_training",
+            repo_path_or_name=f"{WORKING_REPO_DIR}/{REPO_NAME}",
+            api_endpoint=ENDPOINT_STAGING,
+            token=self._token,
+            git_user="ci",
+            git_email="ci@dummy.com",
+        )
+
+        model = self.model_fit(
+            model,
+            callback=[push_to_hub_callback],
+            num_epochs=1,
+        )
+
+        self.assertEqual(
+            len(
+                check_output(
+                    f"git --git-dir {WORKING_REPO_DIR}/{REPO_NAME}/.git log --pretty=oneline".split()
+                )
+                .decode()
+                .split("\n")
+            ),
+            3,
+        )
+
+    def test_callback_batch(self):
+        REPO_NAME = repo_name("PUSH_TO_HUB")
+        model = self.model_init()
+        num_epochs = 2
+        save_steps = 2
+        batch_size = 3
+
+        push_to_hub_callback = PushToHubCallback(
+            save_strategy="steps",
+            repo_path_or_name=f"{WORKING_REPO_DIR}/{REPO_NAME}",
+            api_endpoint=ENDPOINT_STAGING,
+            token=self._token,
+            git_user="ci",
+            git_email="ci@dummy.com",
+            save_steps=save_steps,
+        )
+
+        model = self.model_fit(
+            model,
+            callback=[push_to_hub_callback],
+            num_epochs=num_epochs,
+            batch_size=batch_size,
+        )
+
+        self.assertTrue(
+            len(
+                check_output(
+                    f"git --git-dir {WORKING_REPO_DIR}/{REPO_NAME}/.git log --pretty=oneline".split()
+                )
+                .decode()
+                .split("\n")
+            )
+            # check if commits other than the initial and final commit are pushed
+            > 3
+        )
+
+    def test_callback_epoch(self):
+        REPO_NAME = repo_name("PUSH_TO_HUB")
+        model = self.model_init()
+
+        push_to_hub_callback = PushToHubCallback(
+            save_strategy="epoch",
+            repo_path_or_name=f"{WORKING_REPO_DIR}/{REPO_NAME}",
+            api_endpoint=ENDPOINT_STAGING,
+            token=self._token,
+            git_user="ci",
+            git_email="ci@dummy.com",
+        )
+        num_epochs = 2
+        batch_size = 3
+
+        model = self.model_fit(
+            model,
+            callback=[push_to_hub_callback],
+            num_epochs=num_epochs,
+            batch_size=batch_size,
+        )
+        self.assertTrue(
+            len(
+                check_output(
+                    f"git --git-dir {WORKING_REPO_DIR}/{REPO_NAME}/.git log --pretty=oneline".split()
+                )
+                .decode()
+                .split("\n")
+            )
+            # check if commits other than the initial and final commit are pushed
+            > 3
+        )
 
     def test_save_pretrained(self):
         REPO_NAME = repo_name("save")
-        model = self.model_init()
+        model = tf.keras.models.Sequential()
+        model.add(tf.keras.layers.Dense(2, activation="relu"))
+        model.compile(optimizer="adam", loss="mse")
 
         with pytest.raises(ValueError, match="Model should be built*"):
             save_pretrained_keras(model, f"{WORKING_REPO_DIR}/{REPO_NAME}")
@@ -206,6 +341,7 @@ class HubKerasSequentialTest(HubMixingTestKeras):
         self.assertIn("keras_metadata.pb", files)
         self.assertIn("model.png", files)
         self.assertIn("README.md", files)
+
         self.assertEqual(len(files), 6)
         loaded_model = from_pretrained_keras(f"{WORKING_REPO_DIR}/{REPO_NAME}")
         self.assertIsNone(loaded_model.optimizer)
@@ -213,7 +349,7 @@ class HubKerasSequentialTest(HubMixingTestKeras):
     def test_save_pretrained_model_card_fit(self):
         REPO_NAME = repo_name("save")
         model = self.model_init()
-        model = self.model_fit(model)
+        model = self.model_fit(model, num_epochs=2)
 
         save_pretrained_keras(
             model,
@@ -311,7 +447,7 @@ class HubKerasSequentialTest(HubMixingTestKeras):
     def test_push_to_hub(self):
         REPO_NAME = repo_name("PUSH_TO_HUB")
         model = self.model_init()
-        model.build((None, 2))
+        self.model_fit(model, num_epochs=2)
         push_to_hub_keras(
             model,
             repo_path_or_name=f"{WORKING_REPO_DIR}/{REPO_NAME}",
@@ -350,11 +486,10 @@ class HubKerasSequentialTest(HubMixingTestKeras):
         self.assertTrue("model.png" in [f.rfilename for f in model_info.siblings])
         self._api.delete_repo(repo_id=f"{REPO_NAME}", token=self._token)
 
-    @retry_endpoint
-    def test_push_to_hub_model_card_plot_false(self):
-        REPO_NAME = repo_name("PUSH_TO_HUB_PLOT")
+    def test_push_to_hub_model_card(self):
+        REPO_NAME = repo_name("PUSH_TO_HUB")
         model = self.model_init()
-        model = self.model_fit(model)
+        model = self.model_fit(model, num_epochs=2)
         push_to_hub_keras(
             model,
             repo_path_or_name=f"{WORKING_REPO_DIR}/{REPO_NAME}",
@@ -362,13 +497,35 @@ class HubKerasSequentialTest(HubMixingTestKeras):
             use_auth_token=self._token,
             git_user="ci",
             git_email="ci@dummy.com",
+            task_name="object-detection",
+        )
+        model_info = HfApi(endpoint=ENDPOINT_STAGING).model_info(
+            f"{USER}/{REPO_NAME}",
+        )
+        self.assertTrue("README.md" in [f.rfilename for f in model_info.siblings])
+        self.assertTrue("model.png" in [f.rfilename for f in model_info.siblings])
+        self._api.delete_repo(name=f"{REPO_NAME}", token=self._token)
+
+    @retry_endpoint
+    def test_push_to_hub_model_card_plot_false(self):
+        REPO_NAME = repo_name("PUSH_TO_HUB")
+        model = self.model_init()
+        model = self.model_fit(model, num_epochs=1)
+        push_to_hub_keras(
+            model,
+            repo_path_or_name=f"{WORKING_REPO_DIR}/{REPO_NAME}",
+            api_endpoint=ENDPOINT_STAGING,
+            use_auth_token=self._token,
+            git_user="ci",
+            git_email="ci@dummy.com",
+            task_name="object-detection",
             plot_model=False,
         )
         model_info = HfApi(endpoint=ENDPOINT_STAGING).model_info(
             f"{USER}/{REPO_NAME}",
         )
         self.assertFalse("model.png" in [f.rfilename for f in model_info.siblings])
-        self._api.delete_repo(repo_id=f"{REPO_NAME}", token=self._token)
+        self._api.delete_repo(name=f"{REPO_NAME}", token=self._token)
 
     @retry_endpoint
     def test_push_to_hub_tensorboard(self):
@@ -378,7 +535,7 @@ class HubKerasSequentialTest(HubMixingTestKeras):
             with open(f"{tmpdirname}/log_dir/tensorboard.txt", "w") as fp:
                 fp.write("Keras FTW")
             model = self.model_init()
-            model = self.model_fit(model)
+            model = self.model_fit(model, num_epochs=1)
             push_to_hub_keras(
                 model,
                 repo_path_or_name=f"{WORKING_REPO_DIR}/{REPO_NAME}",
@@ -395,7 +552,7 @@ class HubKerasSequentialTest(HubMixingTestKeras):
         self.assertTrue(
             "logs/tensorboard.txt" in [f.rfilename for f in model_info.siblings]
         )
-        self._api.delete_repo(repo_id=f"{REPO_NAME}", token=self._token)
+        self._api.delete_repo(name=f"{REPO_NAME}", token=self._token)
 
     @retry_endpoint
     def test_override_tensorboard(self):
@@ -444,7 +601,7 @@ class HubKerasSequentialTest(HubMixingTestKeras):
     def test_push_to_hub_model_kwargs(self):
         REPO_NAME = repo_name("PUSH_TO_HUB")
         model = self.model_init()
-        model = self.model_fit(model)
+        model = self.model_fit(model, num_epochs=1)
         push_to_hub_keras(
             model,
             repo_path_or_name=f"{WORKING_REPO_DIR}/{REPO_NAME}",
@@ -471,7 +628,7 @@ class HubKerasSequentialTest(HubMixingTestKeras):
 @require_tf
 class HubKerasFunctionalTest(HubKerasSequentialTest):
     def model_init(self):
-        inputs = tf.keras.layers.Input(shape=(2,))
+        inputs = tf.keras.layers.Input(shape=(None, 2))
         outputs = tf.keras.layers.Dense(2, activation="relu")(inputs)
         model = tf.keras.models.Model(inputs=inputs, outputs=outputs)
         model.compile(optimizer="adam", loss="mse")
@@ -493,7 +650,7 @@ class HubKerasFunctionalTest(HubKerasSequentialTest):
     def test_save_pretrained_fit(self):
         REPO_NAME = repo_name("functional")
         model = self.model_init()
-        model = self.model_fit(model)
+        model = self.model_fit(model, num_epochs=1)
 
         save_pretrained_keras(model, f"{WORKING_REPO_DIR}/{REPO_NAME}")
         files = os.listdir(f"{WORKING_REPO_DIR}/{REPO_NAME}")
